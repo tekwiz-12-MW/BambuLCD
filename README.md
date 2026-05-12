@@ -1,6 +1,5 @@
 # BambuLCD
 
-# BambuLCD V1
 
 A real-time Bambu Lab printer status display built with an ESP32 DEVKIT V1 and a 1602 I2C LCD. Connects directly to your printer over your local network using the same LAN MQTT method as [PrintSphere](https://github.com/cptkirki/PrintSphere) — no cloud dependency, no extra software, no app required.
 
