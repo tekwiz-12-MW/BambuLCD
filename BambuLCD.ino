@@ -1,31 +1,32 @@
 // ============================================================
-//  BambuLCD V1.1
+//  BambuLCD V1.2
 //  ESP32 DEVKIT V1  +  1602 I2C LCD (16×2)  +  Push Button
 //  Bambu Lab A1 Mini — LAN MQTT over TLS (same method as PrintSphere)
 //
 //  Pages (button cycles while printing):
-//    Page 0 – Print : progress %, bar, time left, state
+//    Page 0 – Print : progress %, bar, time left, stage/state
 //    Page 1 – Info  : nozzle temp / target, bed temp / target
 //
-//  States:
-//    Connecting       → "BambuLCD V1 / Connecting..."
-//    Idle             → screen OFF (auto on when print starts)
-//    Idle Screen      → button pressed from idle: shows "IDLE" until btn again
-//    Printing         → Page 0 / Page 1 (button switches; page stays put)
-//    Paused           → Page 0 shows "PAUSED" / Page 1 still works
-//    Print Done       → "PRINT DONE!" — btn to dismiss or auto-off after 60 s
-//    Print Failed     → "PRINT FAILED! / Btn to dismiss" (once per session)
-//    Printer Error    → "PRINTER ERROR! / Btn to dismiss" (once per error code)
-//    Connection Error → "CONNECTION ERR! / Check config.h"
+//  Pre-print stage display (Page 0, row 1):
+//    LEVELING   — auto bed leveling
+//    HTG BED    — heatbed preheating
+//    HEATING    — hotend heating
+//    HOMING     — toolhead homing
+//    CLEANING   — nozzle tip cleaning
+//    DYN FLOW   — dynamic flow calibration
+//    FLOW CAL   — extrusion calibration
+//    SCAN BED   — bed surface scan
+//    1ST LAYER  — first layer inspection
+//    CHK TEMP   — extruder temp check
+//    LOADING    — filament loading/change
+//    PRINTING   — actively printing (no special stage)
 //
-//  Fixes in V1.1:
-//    [1] State machine only fires when gcode_state was in that specific message
-//    [2] MQTT buffer raised to 16384, heap-allocated to avoid stack overflow
-//    [3] Filters by push_status command — ignores heartbeats/info/AMS messages
-//        that falsely carry gcode_state IDLE while printer is printing
-//    [4] Non-blocking WiFi reconnect in main loop
-//    [5] Dismissed popups never re-appear this session; new error code still shows
-//    [6] Stale data indicator (~) if no MQTT message received for 30 s
+//  Changes in V1.2:
+//    [FIX] Stuck at "Connecting..." — on MQTT connect, publishes a pushall
+//          request so the printer immediately sends a full status update.
+//          10-second fallback to IDLE if printer still doesn't respond.
+//    [NEW] Pre-print stage display via stg_cur field
+//    [NEW] Stage-aware stale indicator (~LEVELING, ~HEATING, etc.)
 // ============================================================
 
 #include <WiFi.h>
@@ -50,14 +51,14 @@ PubSubClient     mqtt(secureClient);
 
 // ── Application state machine ─────────────────────────────────────────────
 enum AppState {
-  S_CONNECTING,        // booting / waiting for first MQTT connection
+  S_CONNECTING,        // booting / waiting for first MQTT data
   S_IDLE,              // printer idle → screen off
-  S_IDLE_SCREEN,       // button pressed from idle → shows "IDLE", btn again → off
+  S_IDLE_SCREEN,       // button from idle → shows "IDLE", btn again → off
   S_PRINTING,          // gcode_state == RUNNING
   S_PAUSED,            // gcode_state == PAUSE
-  S_DONE,              // gcode_state == FINISH (brief message then idle)
-  S_FAILED_POPUP,      // gcode_state == FAILED (dismiss with button, once per session)
-  S_PRINTER_ERR_POPUP, // print_error != 0 (dismiss, won't reshow same error code)
+  S_DONE,              // gcode_state == FINISH
+  S_FAILED_POPUP,      // gcode_state == FAILED (once per session)
+  S_PRINTER_ERR_POPUP, // print_error != 0 (once per error code)
   S_CONNECTION_ERR     // MQTT unreachable
 };
 
@@ -69,16 +70,17 @@ float  bedTemp      = 0.0f, bedTarget    = 0.0f;
 int    progress     = 0;
 int    remainMin    = 0;
 int    printError   = 0;
-String gcodeState   = "";      // intentionally empty — unset until first real message
+int    stgCur       = 255;  // current pre-print stage; 255 = none
+String gcodeState   = "";   // intentionally empty until first real message
 bool   dataReceived = false;
 
 // ── Dismiss tracking (persists until power cycle) ─────────────────────────
-int  dismissedErrorCode = 0;    // error code user dismissed — won't reshow same code
-bool failedDismissed    = false; // true after user dismisses PRINT FAILED this session
+int  dismissedErrorCode = 0;
+bool failedDismissed    = false;
 
 // ── Stale data detection ──────────────────────────────────────────────────
 unsigned long lastMsgMs = 0;
-const unsigned long STALE_MS = 30000; // 30 s without a message = stale
+const unsigned long STALE_MS = 30000;
 
 bool isStale() {
   return dataReceived && (millis() - lastMsgMs > STALE_MS);
@@ -97,32 +99,35 @@ bool          holdFired     = false;
 bool          forcedOff     = false;
 
 // ── Timing ────────────────────────────────────────────────────────────────
-unsigned long lastRefresh   = 0;
-unsigned long lastMqttRetry = 0;
-unsigned long lastWifiCheck = 0;
-unsigned long doneSince     = 0;
-unsigned long connectStart  = 0;
+unsigned long lastRefresh      = 0;
+unsigned long lastMqttRetry    = 0;
+unsigned long lastWifiCheck    = 0;
+unsigned long doneSince        = 0;
+unsigned long connectStart     = 0;
+unsigned long mqttConnectedAt  = 0;  // when MQTT last connected successfully
 
-const unsigned long REFRESH_MS      =  500;
-const unsigned long MQTT_RETRY_MS   = 5000;
-const unsigned long WIFI_CHECK_MS   = 10000;
-const unsigned long DONE_MS         = 60000;
-const unsigned long CONNECT_TIMEOUT = 15000;
-const unsigned long HOLD_MS         =  800;
+const unsigned long REFRESH_MS        =  500;
+const unsigned long MQTT_RETRY_MS     = 5000;
+const unsigned long WIFI_CHECK_MS     = 10000;
+const unsigned long DONE_MS           = 60000;
+const unsigned long CONNECT_TIMEOUT   = 15000;
+const unsigned long PUSHALL_TIMEOUT   = 10000;  // give up waiting for pushall response
+const unsigned long HOLD_MS           =  800;
 
 // ── Anti-flicker ──────────────────────────────────────────────────────────
 AppState lastDrawnState = (AppState)255;
 int      lastDrawnPage  = -1;
 
-// ── MQTT topic ────────────────────────────────────────────────────────────
+// ── MQTT topics ───────────────────────────────────────────────────────────
 String reportTopic;
+String requestTopic;
 
 
 // ══════════════════════════════════════════════════════════════════════════
 //  LCD helpers
 // ══════════════════════════════════════════════════════════════════════════
 
-void lcdOn()  { if (!screenOn) { lcd.backlight(); lcd.display();   screenOn = true;  } }
+void lcdOn()  { if (!screenOn) { lcd.backlight(); lcd.display();    screenOn = true;  } }
 void lcdOff() { if (screenOn)  { lcd.noBacklight(); lcd.noDisplay(); screenOn = false; } }
 
 void row(uint8_t r, String s) {
@@ -146,12 +151,39 @@ String fmtTime(int mins) {
 
 
 // ══════════════════════════════════════════════════════════════════════════
+//  Pre-print stage → display string
+//  Mapped for A1 Mini (no LIDAR / chamber scanning hardware)
+//  All stage names kept to 9 chars max so they always fit row 1
+// ══════════════════════════════════════════════════════════════════════════
+
+String getStageStr() {
+  if (appState == S_PAUSED) return "PAUSED";
+
+  switch (stgCur) {
+    case 1:   return "LEVELING";   // auto bed leveling
+    case 2:   return "HTG BED";    // heatbed preheating
+    case 4:   return "LOADING";    // filament loading / change
+    case 7:   return "HEATING";    // hotend heating
+    case 8:   return "FLOW CAL";   // extrusion calibration
+    case 9:   return "SCAN BED";   // bed surface scan
+    case 10:  return "1ST LAYER";  // first layer inspection
+    case 13:  return "HOMING";     // toolhead homing
+    case 14:  return "CLEANING";   // nozzle tip cleaning
+    case 15:  return "CHK TEMP";   // extruder temperature check
+    case 19:  return "DYN FLOW";   // dynamic flow calibration
+    default:  return "PRINTING";   // no special stage / unknown
+  }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
 //  Page renderers
 // ══════════════════════════════════════════════════════════════════════════
 
 //  Row 0:  " 45%[██████────]"
-//  Row 1:  "1h23m   PRINTING"  or  "1h23m  ~PRINTNG" when stale
+//  Row 1:  "1h23m   LEVELING"  or  "1h23m  ~LEVELING" when stale
 void drawPrintPage() {
+  // ── Row 0: progress bar ───────────────────────────────────────────────
   String pct    = padL(String(progress) + "%", 4);
   int    filled = constrain((int)((progress / 100.0f) * 10.0f), 0, 10);
 
@@ -163,13 +195,12 @@ void drawPrintPage() {
   }
   lcd.print("]");
 
-  // ~ prefix on state when data hasn't updated in 30 s
-  String stateStr = isStale()
-                    ? ((appState == S_PAUSED) ? "~PAUSED"  : "~PRINTNG")
-                    : ((appState == S_PAUSED) ? "PAUSED"   : "PRINTING");
-  String timeStr = fmtTime(remainMin);
-  String r1      = timeStr;
-  int    fill    = 16 - (int)timeStr.length() - (int)stateStr.length();
+  // ── Row 1: time + stage label ─────────────────────────────────────────
+  String stage    = getStageStr();
+  String stateStr = isStale() ? ("~" + stage) : stage;
+  String timeStr  = fmtTime(remainMin);
+  String r1       = timeStr;
+  int    fill     = 16 - (int)timeStr.length() - (int)stateStr.length();
   for (int i = 0; i < max(1, fill); i++) r1 += ' ';
   r1 += stateStr;
   row(1, r1);
@@ -195,9 +226,6 @@ void drawIdle()          { row(0, "     IDLE       "); row(1, " Btn to sleep   "
 // ══════════════════════════════════════════════════════════════════════════
 
 void onMessage(char* topic, byte* payload, unsigned int length) {
-
-  // FIX [2]: DynamicJsonDocument allocates on the heap, not the stack.
-  // StaticJsonDocument<16384> would overflow the ESP32's 8 KB task stack.
   DynamicJsonDocument doc(16384);
   DeserializationError err = deserializeJson(doc, payload, length);
   if (err) {
@@ -212,23 +240,20 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
   dataReceived = true;
   lastMsgMs    = millis();
 
-  // Always update temperatures — safe from any message type ──────────────
+  // Always update temperatures — valid from any message type
   if (!pr["nozzle_temper"].isNull())        nozzleTemp   = pr["nozzle_temper"].as<float>();
   if (!pr["nozzle_target_temper"].isNull()) nozzleTarget = pr["nozzle_target_temper"].as<float>();
   if (!pr["bed_temper"].isNull())           bedTemp      = pr["bed_temper"].as<float>();
   if (!pr["bed_target_temper"].isNull())    bedTarget    = pr["bed_target_temper"].as<float>();
 
-  // FIX [3]: Only process print state from push_status messages.
-  // Non-status messages (heartbeat, push_info, AMS updates, get_version)
-  // can carry gcode_state "IDLE" even while the printer is actively printing.
+  // Only process print state from push_status messages
   String cmd = pr["command"].isNull() ? "" : pr["command"].as<String>();
   if (cmd != "push_status" && cmd != "") {
     Serial.printf("[MQTT] Skipping non-status command: '%s'\n", cmd.c_str());
     return;
   }
 
-  // FIX [1]: Only update gcodeState if THIS message explicitly contains it.
-  // If absent, do not use the stale cached value to drive state transitions.
+  // Only update gcodeState if this specific message contains it
   bool hasGcodeState = !pr["gcode_state"].isNull();
   if (hasGcodeState) gcodeState = pr["gcode_state"].as<String>();
 
@@ -236,22 +261,25 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
   if (!pr["mc_remaining_time"].isNull()) remainMin = pr["mc_remaining_time"].as<int>();
   if (!pr["print_error"].isNull())       printError = pr["print_error"].as<int>();
 
-  // FIX [1] continued: bail if no state info was in this message
+  // Parse current pre-print stage (255 = none / between stages)
+  if (!pr["stg_cur"].isNull()) stgCur = pr["stg_cur"].as<int>();
+  // Some firmware sends stg as an array; stg_cur is the scalar version
+  // If your firmware doesn't send stg_cur, stgCur stays 255 (shows "PRINTING")
+
+  // Bail if no state info was in this message
   if (!hasGcodeState) return;
 
-  // Don't override a popup the user is actively viewing
+  // Don't override a popup the user is viewing
   if (appState == S_FAILED_POPUP || appState == S_PRINTER_ERR_POPUP) return;
 
-  // Printer hardware error — top priority.
-  // FIX [5]: Only shows if it's a NEW error code (not one already dismissed)
+  // Hardware error — top priority, only if new/different error code
   if (printError != 0 && printError != dismissedErrorCode) {
     appState = S_PRINTER_ERR_POPUP;
     return;
   }
 
-  // State transitions
   if (gcodeState == "RUNNING") {
-    failedDismissed    = false; // new print → reset dismissed flags
+    failedDismissed    = false;
     dismissedErrorCode = 0;
     if (appState != S_PRINTING && appState != S_PAUSED) page = 0;
     appState = S_PRINTING;
@@ -260,20 +288,20 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
     appState = S_PAUSED;
   }
   else if (gcodeState == "FAILED") {
-    // FIX [5]: don't re-show after user dismissed it this session
     if (!failedDismissed) appState = S_FAILED_POPUP;
   }
   else if (gcodeState == "FINISH") {
     if (appState != S_DONE) { appState = S_DONE; doneSince = millis(); }
   }
   else if (gcodeState == "IDLE") {
+    stgCur = 255; // clear stage on idle
     if (appState != S_IDLE_SCREEN) appState = S_IDLE;
   }
 }
 
 
 // ══════════════════════════════════════════════════════════════════════════
-//  MQTT reconnect (non-blocking)
+//  MQTT reconnect + pushall request
 // ══════════════════════════════════════════════════════════════════════════
 
 void mqttReconnect() {
@@ -287,8 +315,20 @@ void mqttReconnect() {
 
   if (mqtt.connect(id.c_str(), "bblp", BAMBU_ACCESS_CODE)) {
     mqtt.subscribe(reportTopic.c_str());
+    mqttConnectedAt = millis();
     Serial.println("[MQTT] Connected → " + reportTopic);
+
+    // ── FIX: Stuck at connecting ──────────────────────────────────────
+    // Request a full status dump from the printer right now.
+    // Without this, an idle printer won't send push_status on its own,
+    // and the display would sit at "Connecting..." forever.
+    // The printer responds with a complete push_status message within ~1 s.
+    String payload = "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"pushall\"}}";
+    bool sent = mqtt.publish(requestTopic.c_str(), payload.c_str());
+    Serial.printf("[MQTT] pushall request %s\n", sent ? "sent" : "FAILED");
+
     if (appState == S_CONNECTION_ERR) appState = S_CONNECTING;
+
   } else {
     Serial.printf("[MQTT] Failed rc=%d\n", mqtt.state());
     if ((appState == S_CONNECTING || appState == S_CONNECTION_ERR) &&
@@ -308,7 +348,7 @@ void onHold() {
   if (forcedOff) {
     lcdOff();
   } else {
-    lastDrawnState = (AppState)255; // force full redraw on wake
+    lastDrawnState = (AppState)255;
   }
 }
 
@@ -329,12 +369,12 @@ void onPress() {
       appState = S_IDLE;
       break;
     case S_FAILED_POPUP:
-      failedDismissed = true;  // FIX [5]: mark dismissed, won't reappear this session
+      failedDismissed = true;
       gcodeState      = "IDLE";
       appState        = S_IDLE;
       break;
     case S_PRINTER_ERR_POPUP:
-      dismissedErrorCode = printError; // FIX [5]: suppress this code until power cycle
+      dismissedErrorCode = printError;
       gcodeState         = "IDLE";
       appState           = S_IDLE;
       break;
@@ -375,6 +415,15 @@ void handleButton() {
 // ══════════════════════════════════════════════════════════════════════════
 
 void updateLcd() {
+  // ── Pushall fallback: if connected but no push_status after 10s → IDLE ─
+  // This fires if the printer is idle and doesn't respond to pushall,
+  // or if the pushall response didn't contain gcode_state.
+  if (appState == S_CONNECTING && mqtt.connected() &&
+      mqttConnectedAt > 0 && (millis() - mqttConnectedAt > PUSHALL_TIMEOUT)) {
+    Serial.println("[BambuLCD] No status after pushall — assuming IDLE");
+    appState = S_IDLE;
+  }
+
   if (forcedOff) { lcdOff(); return; }
 
   bool dynamic = (appState == S_PRINTING || appState == S_PAUSED);
@@ -409,8 +458,8 @@ void updateLcd() {
 // ══════════════════════════════════════════════════════════════════════════
 
 void setup() {
-  Serial.begin(115200);
-  Serial.println("\n[BambuLCD] V1.1 — starting up");
+  Serial.begin(115200);  // ← Serial Monitor must be set to 115200 baud
+  Serial.println("\n[BambuLCD] V1.2 — starting up");
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
@@ -426,17 +475,20 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print('.'); }
   Serial.println("\n[WiFi] IP: " + WiFi.localIP().toString());
 
-  secureClient.setInsecure(); // Bambu uses self-signed certs; no CA to verify against
-  reportTopic = "device/" + String(BAMBU_SERIAL) + "/report";
+  secureClient.setInsecure();
+
+  reportTopic  = "device/" + String(BAMBU_SERIAL) + "/report";
+  requestTopic = "device/" + String(BAMBU_SERIAL) + "/request";
+
   mqtt.setServer(BAMBU_IP, 8883);
   mqtt.setCallback(onMessage);
-  mqtt.setBufferSize(16384); // FIX [2]: raised from 8192
+  mqtt.setBufferSize(16384);
 
   connectStart = millis();
 }
 
 void loop() {
-  // FIX [4]: non-blocking WiFi reconnect
+  // Non-blocking WiFi reconnect check
   if (millis() - lastWifiCheck >= WIFI_CHECK_MS) {
     lastWifiCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
