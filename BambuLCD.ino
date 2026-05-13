@@ -27,6 +27,14 @@
 //          10-second fallback to IDLE if printer still doesn't respond.
 //    [NEW] Pre-print stage display via stg_cur field
 //    [NEW] Stage-aware stale indicator (~LEVELING, ~HEATING, etc.)
+//
+//  Patch V1.2.1:
+//    [FIX] All dismissed notifications now stay dismissed for the session.
+//          Opening Bambu Handy triggers a fresh printer status push — without
+//          this fix any notification whose state was still active on the
+//          printer (FINISH, FAILED, error code) would re-appear on the LCD.
+//          Added doneDismissed for PRINT DONE, same pattern already used by
+//          failedDismissed and dismissedErrorCode. All three now verified.
 // ============================================================
 
 #include <WiFi.h>
@@ -75,8 +83,11 @@ String gcodeState   = "";   // intentionally empty until first real message
 bool   dataReceived = false;
 
 // ── Dismiss tracking (persists until power cycle) ─────────────────────────
-int  dismissedErrorCode = 0;
-bool failedDismissed    = false;
+// All three flags use the same pattern: set on dismiss, reset on new print.
+// This prevents Bambu Handy's status push from re-triggering old notifications.
+int  dismissedErrorCode = 0;     // error code dismissed — same code won't reshow
+bool failedDismissed    = false; // true after PRINT FAILED dismissed this session
+bool doneDismissed      = false; // true after PRINT DONE dismissed this session
 
 // ── Stale data detection ──────────────────────────────────────────────────
 unsigned long lastMsgMs = 0;
@@ -279,7 +290,8 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
   }
 
   if (gcodeState == "RUNNING") {
-    failedDismissed    = false;
+    failedDismissed    = false; // new print — reset all dismiss flags
+    doneDismissed      = false;
     dismissedErrorCode = 0;
     if (appState != S_PRINTING && appState != S_PAUSED) page = 0;
     appState = S_PRINTING;
@@ -291,10 +303,11 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
     if (!failedDismissed) appState = S_FAILED_POPUP;
   }
   else if (gcodeState == "FINISH") {
-    if (appState != S_DONE) { appState = S_DONE; doneSince = millis(); }
+    // doneDismissed prevents re-trigger when Handy app opens and pushes FINISH again
+    if (appState != S_DONE && !doneDismissed) { appState = S_DONE; doneSince = millis(); }
   }
   else if (gcodeState == "IDLE") {
-    stgCur = 255; // clear stage on idle
+    stgCur = 255;
     if (appState != S_IDLE_SCREEN) appState = S_IDLE;
   }
 }
@@ -366,7 +379,8 @@ void onPress() {
       appState = S_IDLE;
       break;
     case S_DONE:
-      appState = S_IDLE;
+      doneDismissed = true;  // won't reshow even if Handy pushes FINISH again
+      appState      = S_IDLE;
       break;
     case S_FAILED_POPUP:
       failedDismissed = true;
@@ -445,7 +459,10 @@ void updateLcd() {
     case S_DONE:
       lcdOn();
       drawDone();
-      if (millis() - doneSince >= DONE_MS) appState = S_IDLE;
+      if (millis() - doneSince >= DONE_MS) {
+        doneDismissed = true;  // also mark dismissed on auto-timeout
+        appState      = S_IDLE;
+      }
       break;
     case S_FAILED_POPUP:      lcdOn(); drawFailed();     break;
     case S_PRINTER_ERR_POPUP: lcdOn(); drawPrinterErr(); break;
@@ -459,7 +476,7 @@ void updateLcd() {
 
 void setup() {
   Serial.begin(115200);  // ← Serial Monitor must be set to 115200 baud
-  Serial.println("\n[BambuLCD] V1.2 — starting up");
+  Serial.println("\n[BambuLCD] V1.2.1 — starting up");
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
